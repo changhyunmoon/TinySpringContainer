@@ -2,10 +2,14 @@ package container;
 
 import annotation.MyPostConstruct;
 import annotation.MyPreDestroy;
+import annotation.MyPrimary;
+import annotation.MyQualifier;
 import exception.CircularDependencyException;
 import exception.NoSuchBeanException;
+import exception.NoUniqueBeanException;
 import scan.ComponentScanner;
 
+import java.lang.annotation.Annotation;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.*;
@@ -81,14 +85,43 @@ public class SimpleContainer {
         .filter(def -> type.isAssignableFrom(def.getType()))
         .collect(Collectors.toList());
 
+    // 1. 후보가 없으면 예외
     if (candidates.isEmpty()) {
       throw new NoSuchBeanException("등록되지 않은 타입입니다: " + type.getName());
     }
-    if (candidates.size() > 1) {
-      // 7단계에서 @Primary/@Qualifier로 정식 처리 예정
+
+    // 2. 후보가 하나면 바로 반환
+    if (candidates.size() == 1) {
+      return (T) getBean(candidates.get(0).getBeanName());
     }
-    // 이름 기반 조회로 위임 → 캐시를 자동으로 거치게 됨
-    return (T) getBean(candidates.get(0).getBeanName());
+
+    // 3. 후보가 여러 개면 @MyPrimary 확인
+    List<BeanDefinition> primaryCandidates = candidates.stream()
+        .filter(def -> def.getType().isAnnotationPresent(MyPrimary.class))
+        .collect(Collectors.toList());
+
+    // 3-1. @MyPrimary가 하나면 그것을 반환
+    if (primaryCandidates.size() == 1) {
+      return (T) getBean(primaryCandidates.get(0).getBeanName());
+    }
+
+    // 3-2. @MyPrimary도 여러 개면 예외
+    if (primaryCandidates.size() > 1) {
+      throw new NoUniqueBeanException(
+          "@MyPrimary가 여러 개입니다: " +
+              primaryCandidates.stream()
+                  .map(BeanDefinition::getBeanName)
+                  .collect(Collectors.joining(", "))
+      );
+    }
+
+    // 4. @MyPrimary도 없으면 예외 — 후보 목록을 메시지에 포함
+    throw new NoUniqueBeanException(
+        type.getName() + " 타입의 빈이 여러 개입니다: " +
+            candidates.stream()
+                .map(BeanDefinition::getBeanName)
+                .collect(Collectors.joining(", "))
+    );
   }
 
   //실제 인스턴스 생성
@@ -96,32 +129,42 @@ public class SimpleContainer {
     클래스 정보를 받아서, 그 클래스가 필요로 하는 객체들을 자동으로 조립해 완성된 인스턴스를 반환하는 것
    */
   private Object createInstance(Class<?> clazz) {
-    // 1. 생성자를 가져온다.
-    //    getDeclaredConstructors()[0] : 선언된 첫 번째 생성자를 사용
-    //    생성자가 여러 개일 때 처리는 추후 @MyAutowired 단계에서 다룬다.
     Constructor<?> constructor = clazz.getDeclaredConstructors()[0];
-
-    // 2. 생성자 파라미터 타입 목록을 꺼낸다.
     Class<?>[] paramTypes = constructor.getParameterTypes();
 
-    // 3. 파라미터가 없으면 기본 생성자로 바로 생성한다.
     if (paramTypes.length == 0) {
       try {
-        return constructor.newInstance();
+        Object instance = constructor.newInstance();
+        invokePostConstruct(instance);
+        return instance;
       } catch (Exception e) {
         throw new IllegalStateException("빈 생성에 실패했습니다: " + clazz.getName(), e);
       }
     }
 
-    // 4. 파라미터가 있으면 각 타입을 getBean()으로 재귀 해결한다.
+    // 파라미터 어노테이션 목록을 가져온다
+    // constructor.getParameterAnnotations() →
+    // [[파라미터1의 어노테이션들], [파라미터2의 어노테이션들], ...]
+    Annotation[][] parameterAnnotations = constructor.getParameterAnnotations();
+
     Object[] params = new Object[paramTypes.length];
     for (int i = 0; i < paramTypes.length; i++) {
-      params[i] = getBean(paramTypes[i]);  // 의존 빈을 타입으로 조회
+      // 이 파라미터에 @MyQualifier가 붙어있는지 확인
+      MyQualifier qualifier = findQualifier(parameterAnnotations[i]);
+
+      if (qualifier != null) {
+        // @MyQualifier가 있으면 지정된 이름으로 직접 조회
+        params[i] = getBean(qualifier.value());
+      } else {
+        // 없으면 타입으로 조회 (기존 방식)
+        params[i] = getBean(paramTypes[i]);
+      }
     }
 
-    // 5. 해결된 파라미터로 인스턴스를 생성한다.
     try {
-      return constructor.newInstance(params);
+      Object instance = constructor.newInstance(params);
+      invokePostConstruct(instance);
+      return instance;
     } catch (Exception e) {
       throw new IllegalStateException("빈 생성에 실패했습니다: " + clazz.getName(), e);
     }
@@ -157,6 +200,16 @@ public class SimpleContainer {
         }
       }
     }
+  }
+
+  // 파라미터 어노테이션 배열에서 @MyQualifier를 찾아 반환
+  private MyQualifier findQualifier(Annotation[] annotations) {
+    for (Annotation annotation : annotations) {
+      if (annotation instanceof MyQualifier) {
+        return (MyQualifier) annotation;
+      }
+    }
+    return null;
   }
 
 }
